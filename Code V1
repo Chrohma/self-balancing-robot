@@ -1,0 +1,159 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+
+// Motor A (left) — OUT1/OUT2
+#define ENA 5
+#define IN1 6
+#define IN2 7
+
+// Motor B (right, mirrored) — OUT3/OUT4
+#define ENB 8
+#define IN3 9
+#define IN4 10
+
+// ── PID gains — tune in this order: Kp → Kd → Ki ──
+float Kp = 25.0;
+float Ki = 0.0;
+float Kd = 1.2;
+
+// ── PID state ──
+float setpoint   = 0.0;
+float integral   = 0.0;
+float lastError  = 0.0;
+unsigned long lastTime = 0;
+
+// ── Safety & hardware constants ──
+#define FALL_ANGLE   30.0   // degrees — cut motors if exceeded
+#define PWM_DEADBAND 60     // minimum PWM that actually moves motors
+#define PWM_MAX      255
+
+// ── Kalman filter state (1D, on pitch) ──
+float kalmanAngle = 0.0;
+float kalmanP     = 1.0;   // estimate error covariance
+const float kalmanQ = 0.001; // process noise — lower = trust model more
+const float kalmanR = 0.03;  // measurement noise — higher = trust sensor less
+
+float kalmanUpdate(float measurement) {
+  // Predict
+  kalmanP += kalmanQ;
+  // Update
+  float K = kalmanP / (kalmanP + kalmanR);  // Kalman gain
+  kalmanAngle += K * (measurement - kalmanAngle);
+  kalmanP *= (1.0 - K);
+  return kalmanAngle;
+}
+
+// ── Get pitch from quaternion (correct axis, no gimbal lock) ──
+float getPitch() {
+  imu::Quaternion q = bno.getQuat();
+  q.normalize();
+
+  // Convert quaternion → pitch (rotation about X axis)
+  // This is the forward/backward tilt — correct axis for balancing
+  float pitch = atan2(
+    2.0f * (q.w() * q.x() + q.y() * q.z()),
+    1.0f - 2.0f * (q.x() * q.x() + q.y() * q.y())
+  ) * 180.0 / M_PI;
+
+  return pitch;
+}
+
+// ── Motor functions ──
+void motorA(int speed) {
+  speed = constrain(speed, -PWM_MAX, PWM_MAX);
+  if (abs(speed) < PWM_DEADBAND) {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+    analogWrite(ENA, 0); return;
+  }
+  if (speed > 0) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
+  else           { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); speed = -speed; }
+  analogWrite(ENA, speed);
+}
+
+void motorB(int speed) {
+  // mirrored — IN3/IN4 flipped
+  speed = constrain(speed, -PWM_MAX, PWM_MAX);
+  if (abs(speed) < PWM_DEADBAND) {
+    digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+    analogWrite(ENB, 0); return;
+  }
+  if (speed > 0) { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+  else           { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  speed = -speed; }
+  analogWrite(ENB, speed);
+}
+
+void stopMotors() { motorA(0); motorB(0); }
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  stopMotors();
+
+  if (!bno.begin()) {
+    Serial.println("BNO055 not found — check wiring.");
+    while (1);
+  }
+  bno.setExtCrystalUse(true); // better accuracy
+
+  Serial.println("Hold robot still — calibrating setpoint...");
+  delay(2000);
+
+  // Average 200 quaternion-based pitch readings for setpoint
+  float sum = 0;
+  for (int i = 0; i < 200; i++) {
+    sum += getPitch();
+    delay(5);
+  }
+  setpoint = sum / 200.0;
+  kalmanAngle = setpoint; // seed Kalman with calibrated angle
+
+  Serial.print("Setpoint: "); Serial.println(setpoint);
+  Serial.println("Balancing...");
+  lastTime = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  if (dt < 0.005) return; // max 200Hz
+  lastTime = now;
+
+  // Get pitch → run through Kalman filter
+  float rawPitch    = getPitch();
+  float pitch       = kalmanUpdate(rawPitch);
+  float error       = pitch - setpoint;
+
+  // Safety cutoff
+  if (abs(error) > FALL_ANGLE) {
+    stopMotors();
+    integral = 0;
+    Serial.println("FALLEN — stopped");
+    delay(500);
+    return;
+  }
+
+  // PID
+  integral += error * dt;
+  integral  = constrain(integral, -50.0, 50.0); // anti-windup
+  float derivative = (error - lastError) / dt;
+  lastError = error;
+
+  float output = -((Kp * error) + (Ki * integral) + (Kd * derivative));
+  output = constrain(output, -PWM_MAX, PWM_MAX);
+
+  motorA((int)output);
+  motorB((int)output);
+
+  // Serial plotter friendly output
+  Serial.print("Setpoint:"); Serial.print(setpoint);
+  Serial.print(" Pitch:");   Serial.print(pitch);
+  Serial.print(" Raw:");     Serial.print(rawPitch);
+  Serial.print(" Error:");   Serial.print(error);
+  Serial.print(" Output:");  Serial.println((int)output);
+}

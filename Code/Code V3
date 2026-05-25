@@ -1,0 +1,232 @@
+// ============================================================
+//   SELF-BALANCING ROBOT — Unified State Feedback Controller
+//   Arduino Mega 2560 + BNO055 + FIT0186 w/ encoders + DRI0041
+//
+//   One controller, four sensor inputs, one output:
+//     output = -(K1·θ + K2·θ̇ + K3·x + K4·ẋ)
+//
+//   Tune in this order:
+//     1. K1 alone — find smallest value that makes it try to catch
+//     2. Add K2 — increase until oscillation damps out
+//     3. Add K4 — increase until it stops drifting away
+//     4. Add K3 — increase until it returns to start when pushed
+// ============================================================
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+
+// ── Motor pins ──
+#define ENA 5
+#define IN1 6
+#define IN2 7
+#define ENB 8
+#define IN3 9
+#define IN4 10
+
+// ── Encoder pins ──
+#define ENC_LEFT_A   2
+#define ENC_LEFT_B   4
+#define ENC_RIGHT_A  3
+#define ENC_RIGHT_B  11
+
+// ── Encoder state ──
+volatile long leftTicks  = 0;
+volatile long rightTicks = 0;
+
+void leftISR() {
+  if (digitalRead(ENC_LEFT_A) == digitalRead(ENC_LEFT_B)) leftTicks++;
+  else                                                    leftTicks--;
+}
+void rightISR() {
+  if (digitalRead(ENC_RIGHT_A) == digitalRead(ENC_RIGHT_B)) rightTicks++;
+  else                                                      rightTicks--;
+}
+
+// ── Physical constants ──
+const float TICKS_PER_METER = 1383.0f / (2.0f * M_PI * 0.0619f);
+
+// ── Loop timing (fixed 100 Hz) ──
+const unsigned long LOOP_PERIOD_MS = 10;
+const float DT = 0.010f;
+
+// ── State feedback gains ──
+// Start ONLY with K1 nonzero, then add others in tuning order
+float K1 = 25.0f;     // θ   — angle
+float K2 = 0.8f;      // θ̇   — angle rate
+float K3 = 0.0f;      // x   — position (start at 0)
+float K4 = 0.0f;      // ẋ   — velocity (start at 0)
+
+// ── State variables ──
+float targetPitch = 0.0f;
+long  positionRef = 0;     // tick count at engagement (the "home")
+
+// ── Velocity filter (encoder noise damper) ──
+float velocityFiltered = 0.0f;
+const float VEL_ALPHA = 0.7f;   // 0=no filter, 1=infinite smoothing
+
+// ── Safety ──
+#define FALL_ANGLE   30.0f
+#define ENGAGE_ANGLE  3.0f
+#define PWM_MIN      25
+#define PWM_MAX      255
+
+enum BalanceState { WAITING, BALANCING, FALLEN };
+BalanceState state = WAITING;
+
+unsigned long nextLoopTime = 0;
+long lastTickSum = 0;
+
+// ============================================================
+//   SENSORS
+// ============================================================
+
+float getPitch() {
+  imu::Quaternion q = bno.getQuat();
+  q.normalize();
+  return atan2(
+    2.0f * (q.w() * q.x() + q.y() * q.z()),
+    1.0f - 2.0f * (q.x() * q.x() + q.y() * q.y())
+  ) * 180.0f / M_PI;
+}
+
+float getGyroRate() {
+  imu::Vector<3> g = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+  return g.x();   // deg/s
+}
+
+// Combined position and velocity from encoders
+void getPositionAndVelocity(float &positionMeters, float &velocityMPS) {
+  long tickSum = (leftTicks + rightTicks) / 2;
+  long deltaTicks = tickSum - lastTickSum;
+  lastTickSum = tickSum;
+
+  positionMeters = (tickSum - positionRef) / TICKS_PER_METER;
+
+  float rawVel = (deltaTicks / TICKS_PER_METER) / DT;
+  velocityFiltered = VEL_ALPHA * velocityFiltered + (1.0f - VEL_ALPHA) * rawVel;
+  velocityMPS = velocityFiltered;
+}
+
+// ============================================================
+//   MOTORS
+// ============================================================
+
+void driveMotor(int pwm, int enPin, int inA, int inB, bool mirrored) {
+  pwm = constrain(pwm, -PWM_MAX, PWM_MAX);
+  if (abs(pwm) < PWM_MIN) {
+    digitalWrite(inA, LOW); digitalWrite(inB, LOW);
+    analogWrite(enPin, 0); return;
+  }
+  bool forward = (pwm > 0);
+  if (mirrored) forward = !forward;
+  if (forward) { digitalWrite(inA, HIGH); digitalWrite(inB, LOW); }
+  else         { digitalWrite(inA, LOW);  digitalWrite(inB, HIGH); }
+  analogWrite(enPin, abs(pwm));
+}
+
+void drive(int pwm) {
+  driveMotor(pwm, ENA, IN1, IN2, false);
+  driveMotor(pwm, ENB, IN3, IN4, true);
+}
+
+void stopMotors() { drive(0); }
+
+// ============================================================
+//   SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  stopMotors();
+
+  pinMode(ENC_LEFT_A,  INPUT_PULLUP);
+  pinMode(ENC_LEFT_B,  INPUT_PULLUP);
+  pinMode(ENC_RIGHT_A, INPUT_PULLUP);
+  pinMode(ENC_RIGHT_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_A),  leftISR,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_A), rightISR, CHANGE);
+
+  if (!bno.begin()) {
+    Serial.println(F("BNO055 not found"));
+    while (1);
+  }
+  bno.setExtCrystalUse(true);
+  Wire.setClock(400000);   // faster I2C — less sensor lag
+
+  Serial.println(F("Hold UPRIGHT and still — calibrating in 3s..."));
+  delay(3000);
+
+  float sum = 0;
+  for (int i = 0; i < 200; i++) { sum += getPitch(); delay(5); }
+  targetPitch = sum / 200.0f;
+
+  Serial.print(F("Balance point: "));
+  Serial.println(targetPitch);
+  Serial.println(F("Hold upright, wait for ENGAGED, then release."));
+
+  nextLoopTime = millis();
+}
+
+// ============================================================
+//   MAIN LOOP
+// ============================================================
+
+void loop() {
+  // Fixed 100 Hz
+  if ((long)(millis() - nextLoopTime) < 0) return;
+  nextLoopTime += LOOP_PERIOD_MS;
+
+  float pitch    = getPitch();
+  float gyroRate = getGyroRate();
+  float angleError = pitch - targetPitch;
+
+  float position, velocity;
+  getPositionAndVelocity(position, velocity);
+
+  // ── State machine ──
+  if (state == WAITING || state == FALLEN) {
+    stopMotors();
+    velocityFiltered = 0;
+    if (abs(angleError) < ENGAGE_ANGLE) {
+      // Capture this moment as "home"
+      positionRef = (leftTicks + rightTicks) / 2;
+      lastTickSum = positionRef;
+      state = BALANCING;
+      Serial.println(F("ENGAGED"));
+    }
+    return;
+  }
+
+  // BALANCING
+  if (abs(angleError) > FALL_ANGLE) {
+    stopMotors();
+    state = FALLEN;
+    Serial.println(F("FALLEN"));
+    return;
+  }
+
+  // ── THE ENTIRE CONTROLLER ──
+  // All four state variables, one weighted sum, one output
+  float output = -(K1 * angleError
+                 + K2 * gyroRate
+                 + K3 * position
+                 + K4 * velocity);
+
+  output = constrain(output, -PWM_MAX, PWM_MAX);
+  drive((int)output);
+
+  // ── Telemetry ──
+  Serial.print(F("θ:"));   Serial.print(angleError, 2);
+  Serial.print(F(" θ̇:"));  Serial.print(gyroRate, 1);
+  Serial.print(F(" x:"));  Serial.print(position, 3);
+  Serial.print(F(" ẋ:"));  Serial.print(velocity, 2);
+  Serial.print(F(" Out:")); Serial.println((int)output);
+}

@@ -1,0 +1,553 @@
+// VERSION 3.1 -- 2026-05-31  (3S LiPo motor pack -- full power)
+// ============================================================
+//   SELF-BALANCING ROBOT
+//   Arduino Mega 2560 + BNO055 + FIT0186 (encoders) + DRI0041
+//   CoM height ~12.7 cm  ->  pendulum timescale sqrt(L/g) ~= 114 ms
+//
+//   CONTROL = cascaded two-loop:
+//     Outer (slow): PI on wheel velocity  -> nudges target lean angle
+//                   (keeps the robot from drifting/running away)
+//     Inner (fast): PD+I on angle         -> the balance core
+//
+//   BURST POWER MGR: runs at a sustainable ceiling, but unleashes a brief
+//   full-power pulse to catch a hard lean, then backs off so the L91 pack
+//   recovers -- matching the cells' pulse rating.
+//
+//   POWER-AWARE: 8xAA (lithium L91) can't take instant current spikes,
+//   so the motor command is slew-rate limited + ceiling-capped, and we
+//   COAST (never short-brake) at idle. Watch the driver's power LED:
+//   if it dims on hard moves, lower MAX_PWM_STEP / OUTPUT_CEILING.
+//
+//   SENSING: BNO055 NDOF gravity vector (accel-rejecting, drift-free)
+//   blended with gyro for low latency. Gyro bias removed at startup.
+//
+//   TUNING: live over Serial (115200). Send '?' for the key map.
+//   SAFETY: EEPROM crash recorder. Reset + send 'd' within 4s to dump.
+// ============================================================
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <EEPROM.h>
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+
+// -- Motor pins (DRI0041: IN pins set direction, EN pin is PWM speed) --
+#define ENA 5
+#define IN1 6
+#define IN2 7
+#define ENB 8
+#define IN3 9
+#define IN4 10
+
+// -- Encoder pins --
+#define ENC_LEFT_A   2
+#define ENC_LEFT_B   4
+#define ENC_RIGHT_A  3
+#define ENC_RIGHT_B  11
+
+#define LED 13
+
+// -- Encoder state --
+volatile long leftTicks  = 0;
+volatile long rightTicks = 0;
+void leftISR()  { if (digitalRead(ENC_LEFT_A)  == digitalRead(ENC_LEFT_B))  leftTicks++;  else leftTicks--;  }
+void rightISR() { if (digitalRead(ENC_RIGHT_A) == digitalRead(ENC_RIGHT_B)) rightTicks++; else rightTicks--; }
+
+// -- Physical constants --
+// T81 BaneBots wheel 3-7/8" dia = 0.0984 m -> radius 0.0492 m.
+// Set ENCODER_CPR to your motor's counts/rev (quadrature, AT THE WHEEL).
+const float WHEEL_RADIUS_M  = 0.0492f;
+const float ENCODER_CPR     = 1398.0f;   // ticks per wheel revolution (measured)
+const float TICKS_PER_METER = ENCODER_CPR / (2.0f * M_PI * WHEEL_RADIUS_M);
+
+// -- Loop timing (100 Hz) --
+const unsigned long LOOP_PERIOD_MS = 10;
+const float DT = 0.010f;
+const float RAD2DEG = 57.2957795f;
+
+// ============================================================
+//   SIGN CONVENTIONS  --  the make-or-break settings.
+//   If the robot drives the WRONG way (falls faster when nudged),
+//   flip BALANCE_SIGN. If the measured angle moves opposite to the
+//   real tilt, flip PITCH_SIGN. If it speeds up instead of slowing
+//   when it drifts, flip VEL_SIGN.
+// ============================================================
+#define PITCH_SIGN    -1.0f   // sign of measured pitch
+#define BALANCE_SIGN  1.0f   // sign of motor command vs angle error
+#define VEL_SIGN      1.0f   // sign of velocity loop's effect on setpoint
+
+// -- Complementary filter --
+#define CF_ALPHA     0.985f  // trust gyro short-term, gravity long-term
+float pitchCF      = 0.0f;
+bool  pitchCFInit  = false;
+float gyroBias     = 0.0f;
+float lastGoodRate = 0.0f;
+bool  imuHealthy   = true;   // false when a BNO055 read looks invalid (dropout)
+
+// ============================================================
+//   GAINS  (live-tunable over Serial -- send '?' for keys)
+// ============================================================
+// Inner angle loop (the balance core)
+float KP_ANGLE = 10.0f;   // PWM per degree of tilt error
+float KD_ANGLE =  0.6f;   // PWM per (deg/s) -- rate damping, critical for a tippy bot
+float KI_ANGLE = 10.0f;   // PWM per (deg*s) -- kills steady lean / trim error
+
+// Outer velocity loop (keeps it from running away). Slow & gentle.
+float KP_VEL = 0.0f;      // degrees of lean per (m/s) of unwanted speed
+float KI_VEL = 0.0f;      // degrees of lean per (m*s)
+float KP_POS = 0.0f;      // degrees of lean per meter from home (set 0 to free-roam)
+
+// -- Static balance-angle offset (structural-lean compensation) --
+// The robot's TRUE balance angle (center of mass over the axle) is not where
+// you hold it at calibration. This shifts "upright" by a fixed amount so the
+// robot sits at its real balance point instead of driving to chase the lean.
+// HOW TO SET IT:
+//   1) Flash with BALANCE_OFFSET = 0. Let it balance, dump the crash log,
+//      and read the steady 'tilt' value it sits at just before it runs off.
+//   2) Set BALANCE_OFFSET to THAT number (same sign). e.g. if it sits at
+//      tilt = -1.5 and rolls, set BALANCE_OFFSET = -1.5.
+//   3) Re-flash. It should now sit near tilt = 0 and stop chasing.
+// IF IT RUNS AWAY FASTER (worse) after setting it: the sign is backwards --
+//   just negate the number (e.g. -1.5 -> +1.5) and re-flash.
+float BALANCE_OFFSET = -1.5f;   // degrees; +/- shifts the balance point
+
+// -- Setpoint / integrator limits (anti-windup) --
+const float MAX_LEAN      = 5.0f;    // outer loop may lean at most this many deg
+const float ANGLE_I_LIMIT = 60.0f;   // |KI_ANGLE * integral| clamp (PWM)
+const float VEL_I_LIMIT   = 4.0f;    // |KI_VEL * integral| clamp (deg)
+
+// -- Power-aware drive (lithium L91 friendly) --
+// Slew limit spreads current draw over time so the pack holds voltage.
+// L91 take ~5A pulses, so we can be fairly snappy. Back these down if the
+// driver's power LED dims on a hard reversal.
+int MAX_PWM_STEP   = 255;    // max PWM change per 10 ms loop (lower = gentler on battery)
+int OUTPUT_CEILING = 255;   // absolute PWM cap (= the burst peak)
+int MIN_DRIVE      = 5;    // PWM floor to overcome gearbox static friction
+#define MIN_EFFORT  3       // below this commanded magnitude -> coast
+
+// -- Burst power manager --
+// The pack holds CEIL_SUSTAINED indefinitely, but can pulse to OUTPUT_CEILING
+// briefly. burstBudget (0..1) drains while pulsing, refills when easy. This
+// hands full authority to catch a hard lean, then backs off so the pack recovers.
+int   CEIL_SUSTAINED   = 255;     // PWM the pack holds without browning out
+float burstBudget      = 1.0f;    // 0..1 reservoir for brief full-power bursts
+const float BURST_DRAIN  = 0.045f;// ~22 loops (~220 ms) of full burst when topped up
+const float BURST_REFILL = 0.012f;// slow recharge while running easy
+
+// -- State / safety --
+float balancePoint = 0.0f;  // upright pitch captured at calibration
+#define FALL_ANGLE   30.0f
+#define ENGAGE_ANGLE  2.5f
+#define PWM_MAX      255
+
+enum BalanceState { WAITING, BALANCING, FALLEN };
+BalanceState state = WAITING;
+
+// -- Controller memory --
+float angleIntegral = 0.0f;
+float velIntegral   = 0.0f;
+float velFiltered   = 0.0f;
+const float VEL_ALPHA = 0.75f;
+long  positionRef = 0;
+long  lastTickSum = 0;
+
+unsigned long nextLoopTime = 0;
+int  telemetryDiv = 0;
+bool emergencyStop = false;
+unsigned long fallLockoutUntil = 0;  // re-engage lockout after a fall
+
+// -- Crash log: logged at 50 Hz (every 2nd loop) = ~3.0 s of history --
+#define LOG_SIZE 150
+int16_t logAngle[LOG_SIZE], logRate[LOG_SIZE], logOut[LOG_SIZE], logVel[LOG_SIZE];
+int16_t logLean[LOG_SIZE],  logBgt[LOG_SIZE];
+int  logIdx = 0;
+bool logWrapped = false;
+
+// ============================================================
+//   CRASH LOG
+// ============================================================
+void logPush(float a, float r, int o, float v, float lean, float bgt) {
+  logAngle[logIdx] = (int16_t)(a * 100.0f);
+  logRate[logIdx]  = (int16_t) r;
+  logOut[logIdx]   = (int16_t) o;
+  logVel[logIdx]   = (int16_t)(v * 100.0f);
+  logLean[logIdx]  = (int16_t)(lean * 100.0f);
+  logBgt[logIdx]   = (int16_t)(bgt * 100.0f);
+  if (++logIdx >= LOG_SIZE) { logIdx = 0; logWrapped = true; }
+}
+
+void clearLog() {
+  logIdx = 0; logWrapped = false;
+  for (int i = 0; i < LOG_SIZE; i++) { logAngle[i]=0; logRate[i]=0; logOut[i]=0; logVel[i]=0; logLean[i]=0; logBgt[i]=0; }
+}
+
+void saveCrashLog() {
+  int count = logWrapped ? LOG_SIZE : logIdx;
+  int start = logWrapped ? logIdx : 0;
+  int addr = 0;
+  EEPROM.update(addr++, 0xAB);
+  EEPROM.update(addr++, count & 0xFF);
+  EEPROM.update(addr++, (count >> 8) & 0xFF);
+  for (int i = 0; i < count; i++) {
+    int s = (start + i) % LOG_SIZE;
+    EEPROM.update(addr++, logAngle[s] & 0xFF); EEPROM.update(addr++, (logAngle[s] >> 8) & 0xFF);
+    EEPROM.update(addr++, logRate[s]  & 0xFF); EEPROM.update(addr++, (logRate[s]  >> 8) & 0xFF);
+    EEPROM.update(addr++, logOut[s]   & 0xFF); EEPROM.update(addr++, (logOut[s]   >> 8) & 0xFF);
+    EEPROM.update(addr++, logVel[s]   & 0xFF); EEPROM.update(addr++, (logVel[s]   >> 8) & 0xFF);
+    EEPROM.update(addr++, logLean[s]  & 0xFF); EEPROM.update(addr++, (logLean[s]  >> 8) & 0xFF);
+    EEPROM.update(addr++, logBgt[s]   & 0xFF); EEPROM.update(addr++, (logBgt[s]   >> 8) & 0xFF);
+  }
+}
+
+// Read one little-endian int16 from EEPROM, advancing addr (sequenced: no UB).
+int16_t eepromReadI16(int &addr) {
+  uint8_t lo = EEPROM.read(addr++);
+  uint8_t hi = EEPROM.read(addr++);
+  return (int16_t)(lo | (hi << 8));
+}
+
+void dumpCrashLog() {
+  int addr = 0;
+  if (EEPROM.read(addr++) != 0xAB) { Serial.println(F("No crash log stored.")); return; }
+  int count = eepromReadI16(addr);
+  Serial.println(F("=== CRASH LOG (oldest -> fall) ==="));
+  Serial.println(F("idx,err,tilt,rate,out,vel,lean,bgt"));
+  for (int i = 0; i < count; i++) {
+    int16_t a = eepromReadI16(addr);
+    int16_t r = eepromReadI16(addr);
+    int16_t o = eepromReadI16(addr);
+    int16_t v = eepromReadI16(addr);
+    int16_t l = eepromReadI16(addr);
+    int16_t b = eepromReadI16(addr);
+    float err = a/100.0f, lean = l/100.0f;
+    Serial.print(i);           Serial.print(',');
+    Serial.print(err, 2);      Serial.print(',');
+    Serial.print(err - lean, 2); Serial.print(',');   // physical tilt = err - lean
+    Serial.print(r);           Serial.print(',');
+    Serial.print(o);           Serial.print(',');
+    Serial.print(v/100.0f, 2); Serial.print(',');
+    Serial.print(lean, 2);     Serial.print(',');
+    Serial.println(b/100.0f, 2);
+  }
+  Serial.println(F("=== END ==="));
+}
+
+// ============================================================
+//   SENSORS
+// ============================================================
+float getGyroRate() {
+  imu::Vector<3> g = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+  float r = (g.x() * PITCH_SIGN) - gyroBias;
+  if (isnan(r) || fabs(r) > 800.0f) return lastGoodRate;
+  lastGoodRate = r;
+  return r;
+}
+
+float getPitch() {
+  // Use the FUSED gravity vector: rejects the robot's own linear acceleration
+  // (raw accel would read a false tilt while the wheels accelerate) and doesn't
+  // drift like an integrated gyro. Blend with gyro for low latency.
+  imu::Vector<3> grav = bno.getVector(Adafruit_BNO055::VECTOR_GRAVITY);
+  float gx = grav.x(), gy = grav.y(), gz = grav.z();
+  // A healthy gravity vector has magnitude ~9.8. On a BNO dropout/reset the
+  // library returns (0,0,0) or garbage (NOT NaN), which reads as a false
+  // "upright" and makes the robot drive blind. Reject by magnitude + flag it.
+  float gmag = sqrt(gx*gx + gy*gy + gz*gz);
+  if (isnan(gmag) || gmag < 4.0f || gmag > 15.0f) { imuHealthy = false; return pitchCF; }
+  imuHealthy = true;
+
+  float gravPitch = atan2(gy, gz) * RAD2DEG * PITCH_SIGN;   // AY = fore/aft tilt axis
+  if (isnan(gravPitch)) return pitchCF;
+
+  if (!pitchCFInit) { pitchCF = gravPitch; pitchCFInit = true; }
+  pitchCF = CF_ALPHA * (pitchCF + lastGoodRate * DT) + (1.0f - CF_ALPHA) * gravPitch;
+  return pitchCF;
+}
+
+void getPositionAndVelocity(float &posMeters, float &velMPS) {
+  long tickSum = (rightTicks - leftTicks) / 2;
+  long delta   = tickSum - lastTickSum;
+  lastTickSum  = tickSum;
+  posMeters = (tickSum - positionRef) / TICKS_PER_METER;
+  float rawVel = (delta / TICKS_PER_METER) / DT;
+  velFiltered = VEL_ALPHA * velFiltered + (1.0f - VEL_ALPHA) * rawVel;
+  velMPS = velFiltered;
+}
+
+// ============================================================
+//   MOTORS  (power-aware: slew limit + ceiling + coast)
+// ============================================================
+void driveMotor(int pwm, int enPin, int inA, int inB, bool mirrored) {
+  pwm = constrain(pwm, -PWM_MAX, PWM_MAX);
+  if (abs(pwm) < MIN_EFFORT) {
+    // Coast (free-wheel). Never short-brake: it locks the wheel and draws
+    // current the pack can't spare.
+    digitalWrite(inA, LOW); digitalWrite(inB, LOW);
+    analogWrite(enPin, 0); return;
+  }
+  // Deadband feedforward: lift small commands above gearbox static friction.
+  int mag = MIN_DRIVE + (long)(abs(pwm) - MIN_EFFORT) * (PWM_MAX - MIN_DRIVE) / (PWM_MAX - MIN_EFFORT);
+  mag = constrain(mag, 0, PWM_MAX);
+  bool forward = (pwm > 0);
+  if (mirrored) forward = !forward;
+  if (forward) { digitalWrite(inA, HIGH); digitalWrite(inB, LOW); }
+  else         { digitalWrite(inA, LOW);  digitalWrite(inB, HIGH); }
+  analogWrite(enPin, mag);
+}
+
+int pwmApplied = 0;   // PWM currently sent (global so the kill switch can zero it)
+void drive(int target) {
+  target = constrain(target, -OUTPUT_CEILING, OUTPUT_CEILING);
+  // Slew-rate limit toward target: bounds the current surge so 8xAA holds
+  // voltage and the driver doesn't brown out (the old reversal "pause").
+  if      (target > pwmApplied + MAX_PWM_STEP) pwmApplied += MAX_PWM_STEP;
+  else if (target < pwmApplied - MAX_PWM_STEP) pwmApplied -= MAX_PWM_STEP;
+  else                                          pwmApplied  = target;
+  driveMotor(pwmApplied, ENA, IN1, IN2, false);
+  driveMotor(pwmApplied, ENB, IN3, IN4, true);
+}
+void stopMotors() { drive(0); }
+
+// HARD kill -- immediate, bypasses the slew limiter. Use on fall/fault so the
+// motors cannot keep driving the robot into the ground.
+void killMotors() {
+  pwmApplied = 0;
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);    analogWrite(ENB, 0);
+}
+
+// ============================================================
+//   LED STATUS
+// ============================================================
+void updateLED() {
+  unsigned long now = millis();
+  if      (emergencyStop)      digitalWrite(LED, (now / 60)  % 2);
+  else if (state == BALANCING) digitalWrite(LED, HIGH);
+  else if (state == FALLEN)    digitalWrite(LED, (now / 120) % 2);
+  else                         digitalWrite(LED, (now / 400) % 2);
+}
+
+// ============================================================
+//   LIVE SERIAL TUNER
+// ============================================================
+void printGains() {
+  Serial.println(F("--- GAINS ---"));
+  Serial.print(F("KP_ANGLE ")); Serial.println(KP_ANGLE);
+  Serial.print(F("KD_ANGLE ")); Serial.println(KD_ANGLE);
+  Serial.print(F("KI_ANGLE ")); Serial.println(KI_ANGLE);
+  Serial.print(F("KP_VEL   ")); Serial.println(KP_VEL);
+  Serial.print(F("KI_VEL   ")); Serial.println(KI_VEL);
+  Serial.print(F("KP_POS   ")); Serial.println(KP_POS);
+  Serial.print(F("STEP ")); Serial.print(MAX_PWM_STEP);
+  Serial.print(F("  SUSCEIL ")); Serial.print(CEIL_SUSTAINED);
+  Serial.print(F("  MINDRV ")); Serial.println(MIN_DRIVE);
+}
+
+void printHelp() {
+  Serial.println(F("=== KEYS ==="));
+  Serial.println(F("Q/A KP_ANGLE +/-   W/S KD_ANGLE +/-   E/D KI_ANGLE +/-"));
+  Serial.println(F("R/F KP_VEL  +/-    T/G KI_VEL  +/-     Y/H KP_POS  +/-"));
+  Serial.println(F("U/J STEP +/-       I/K CEIL +/-        O/L MINDRV +/-"));
+  Serial.println(F("p print   x dump crash log   space=E-STOP   ? help"));
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    switch (c) {
+      case 'q': KP_ANGLE += 2;    break;
+      case 'a': KP_ANGLE -= 2;    break;
+      case 'w': KD_ANGLE += 0.2f; break;
+      case 's': KD_ANGLE -= 0.2f; break;
+      case 'e': KI_ANGLE += 10;   break;
+      case 'd': KI_ANGLE -= 10;   break;
+      case 'r': KP_VEL += 0.5f;   break;
+      case 'f': KP_VEL -= 0.5f;   break;
+      case 't': KI_VEL += 0.2f;   break;
+      case 'g': KI_VEL -= 0.2f;   break;
+      case 'y': KP_POS += 0.2f;   break;
+      case 'h': KP_POS -= 0.2f;   break;
+      case 'u': MAX_PWM_STEP += 5;   break;
+      case 'j': MAX_PWM_STEP -= 5;   break;
+      case 'i': CEIL_SUSTAINED += 5; break;
+      case 'k': CEIL_SUSTAINED -= 5; break;
+      case 'o': MIN_DRIVE += 2;   break;
+      case 'l': MIN_DRIVE -= 2;   break;
+      case 'p': printGains();     break;
+      case 'x': dumpCrashLog();   break;
+      case '?': printHelp();      break;
+      case ' ':
+        emergencyStop = !emergencyStop;
+        Serial.println(emergencyStop ? F("E-STOP ON") : F("E-STOP OFF"));
+        break;
+      default: continue;
+    }
+    if (c != 'p' && c != 'x' && c != '?' && c != ' ') printGains();
+  }
+  if (KD_ANGLE < 0) KD_ANGLE = 0;
+  MAX_PWM_STEP   = constrain(MAX_PWM_STEP, 5, 255);
+  CEIL_SUSTAINED = constrain(CEIL_SUSTAINED, 60, 255);
+  MIN_DRIVE      = constrain(MIN_DRIVE, 0, 120);
+}
+
+// ============================================================
+//   SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  stopMotors();
+
+  pinMode(ENC_LEFT_A,  INPUT_PULLUP); pinMode(ENC_LEFT_B,  INPUT_PULLUP);
+  pinMode(ENC_RIGHT_A, INPUT_PULLUP); pinMode(ENC_RIGHT_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_A),  leftISR,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_A), rightISR, CHANGE);
+
+  Serial.println(F("Send 'd' within 4s to dump last crash log..."));
+  unsigned long t0 = millis();
+  while (millis() - t0 < 4000) {
+    if (Serial.available() && Serial.read() == 'd') { dumpCrashLog(); while (1) digitalWrite(LED, (millis()/500)%2); }
+  }
+  EEPROM.update(0, 0x00);
+
+  if (!bno.begin()) { Serial.println(F("BNO055 not found")); while (1) digitalWrite(LED, (millis()/80)%2); }
+  bno.setExtCrystalUse(true);
+  Wire.setClock(100000);
+  Wire.setWireTimeout(3000, true);   // auto-recover if the I2C bus hangs (motor noise)
+
+  Serial.println(F("Hold UPRIGHT and STILL -- calibrating in 3s..."));
+  delay(3000);
+  // Capture upright balance point AND residual gyro bias together.
+  float pSum = 0, gSum = 0;
+  for (int i = 0; i < 200; i++) {
+    imu::Vector<3> g = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+    gSum += g.x() * PITCH_SIGN;
+    pSum += getPitch();
+    delay(5);
+  }
+  gyroBias     = gSum / 200.0f;
+  balancePoint = pSum / 200.0f;
+  balancePoint += BALANCE_OFFSET;        // shift to the TRUE balance angle
+  Serial.print(F("Balance point: ")); Serial.print(balancePoint);
+  Serial.print(F(" (offset ")); Serial.print(BALANCE_OFFSET); Serial.print(F(")"));
+  Serial.print(F("   gyro bias: ")); Serial.println(gyroBias, 3);
+  Serial.println(F("Stand it up to engage.  Send '?' for tuning keys."));
+
+  nextLoopTime = millis();
+}
+
+// ============================================================
+//   MAIN LOOP  (fixed 100 Hz)
+// ============================================================
+void loop() {
+  handleSerial();
+  if ((long)(millis() - nextLoopTime) < 0) { updateLED(); return; }
+  nextLoopTime += LOOP_PERIOD_MS;
+
+  float gyroRate = getGyroRate();
+  float pitch    = getPitch();
+  float position, velocity;
+  getPositionAndVelocity(position, velocity);
+
+  // IMU dropout guard -- never drive on garbage. Stop, fall-safe, try recovery.
+  if (!imuHealthy) {
+    killMotors();
+    state = FALLEN;
+    fallLockoutUntil = millis() + 1500;
+    static unsigned long lastReinit = 0;
+    if (millis() - lastReinit > 500) {
+      lastReinit = millis();
+      Serial.println(F("IMU FAULT -- reinit"));
+      bno.begin(); bno.setExtCrystalUse(true);
+    }
+    updateLED();
+    return;
+  }
+
+  if (emergencyStop) { killMotors(); updateLED(); return; }
+
+  float tiltFromUpright = pitch - balancePoint;
+
+  // -- Engage / re-engage --
+  if (state == WAITING || state == FALLEN) {
+    killMotors();
+    velFiltered = 0;
+    if (millis() >= fallLockoutUntil && fabs(tiltFromUpright) < ENGAGE_ANGLE) {
+      positionRef   = (rightTicks - leftTicks) / 2;
+      lastTickSum   = positionRef;
+      angleIntegral = 0; velIntegral = 0;
+      pwmApplied    = 0;
+      clearLog();
+      state = BALANCING;
+      Serial.println(F("ENGAGED"));
+    }
+    updateLED();
+    return;
+  }
+
+  // -- Fall detection --
+  if (fabs(tiltFromUpright) > FALL_ANGLE) {
+    killMotors();
+    saveCrashLog();
+    state = FALLEN;
+    fallLockoutUntil = millis() + 1500;
+    Serial.println(F("FALLEN -- motors cut"));
+    updateLED();
+    return;
+  }
+
+  // -- OUTER LOOP: velocity + position -> target lean angle --
+  // If the robot is drifting/rolling, lean it slightly the other way so it
+  // arrests the motion and returns home. Gentle & slow so it doesn't fight
+  // the inner loop. Integral clamped to keep its lean contribution bounded.
+  velIntegral += velocity * DT;
+  float velIClamp = VEL_I_LIMIT / max(KI_VEL, 0.01f);
+  velIntegral = constrain(velIntegral, -velIClamp, velIClamp);
+  float leanCmd = VEL_SIGN * (KP_VEL * velocity + KI_VEL * velIntegral + KP_POS * position);
+  leanCmd = constrain(leanCmd, -MAX_LEAN, MAX_LEAN);
+  float targetAngle = balancePoint - leanCmd;
+
+  // -- INNER LOOP: PD+I on angle (the balance core) --
+  float angleError = pitch - targetAngle;
+  angleIntegral += angleError * DT;
+  float angIClamp = ANGLE_I_LIMIT / max(KI_ANGLE, 0.01f);
+  angleIntegral = constrain(angleIntegral, -angIClamp, angIClamp);
+
+  float output = BALANCE_SIGN * (KP_ANGLE * angleError
+                               + KD_ANGLE * gyroRate
+                               + KI_ANGLE * angleIntegral);
+  // Burst power manager: full power only in short bursts, else sustainable cap.
+  int ceil_now;
+  if (burstBudget > 0.05f && fabs(output) > CEIL_SUSTAINED) {
+    ceil_now = OUTPUT_CEILING;                 // emergency burst
+    burstBudget -= BURST_DRAIN;
+  } else {
+    ceil_now = CEIL_SUSTAINED;                 // sustainable
+    if (fabs(output) < CEIL_SUSTAINED * 0.8f) burstBudget += BURST_REFILL;
+  }
+  burstBudget = constrain(burstBudget, 0.0f, 1.0f);
+  output = constrain(output, (float)-ceil_now, (float)ceil_now);
+  drive((int)output);
+
+  static uint8_t logDiv = 0;
+  if (++logDiv >= 2) { logDiv = 0; logPush(angleError, gyroRate, (int)output, velocity, leanCmd, burstBudget); }
+  updateLED();
+
+  // -- Throttled telemetry (every 5 loops = 20 Hz) so Serial never blocks
+  //    the control loop on a full TX buffer --
+  if (++telemetryDiv >= 5) {
+    telemetryDiv = 0;
+    Serial.print(F("tilt:")); Serial.print(tiltFromUpright, 2);
+    Serial.print(F(" tgt:")); Serial.print(targetAngle - balancePoint, 2);
+    Serial.print(F(" rate:")); Serial.print(gyroRate, 1);
+    Serial.print(F(" vel:")); Serial.print(velocity, 2);
+    Serial.print(F(" out:")); Serial.print((int)output);
+    Serial.print(F(" bgt:")); Serial.println(burstBudget, 2);
+  }
+}

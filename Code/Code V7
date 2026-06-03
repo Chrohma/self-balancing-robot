@@ -92,10 +92,10 @@ bool  imuHealthy   = true;   // false when a BNO055 read looks invalid (dropout)
 // Inner angle loop (the balance core)
 float KP_ANGLE = 10.0f;   // PWM per degree of tilt error
 float KD_ANGLE =  0.6f;   // PWM per (deg/s) -- rate damping, critical for a tippy bot
-float KI_ANGLE = 5.0f;   // PWM per (deg*s) -- kills steady lean / trim error
+float KI_ANGLE = 10.0f;   // PWM per (deg*s) -- kills steady lean / trim error
 
 // Outer velocity loop (keeps it from running away). Slow & gentle.
-float KP_VEL = 1.5f;      // degrees of lean per (m/s) of unwanted speed
+float KP_VEL = 0.0f;      // degrees of lean per (m/s) of unwanted speed
 float KI_VEL = 0.0f;      // degrees of lean per (m*s)
 float KP_POS = 0.0f;      // degrees of lean per meter from home (set 0 to free-roam)
 
@@ -111,7 +111,7 @@ float KP_POS = 0.0f;      // degrees of lean per meter from home (set 0 to free-
 //   3) Re-flash. It should now sit near tilt = 0 and stop chasing.
 // IF IT RUNS AWAY FASTER (worse) after setting it: the sign is backwards --
 //   just negate the number (e.g. -1.5 -> +1.5) and re-flash.
-float BALANCE_OFFSET = -1.7f;   // degrees; +/- shifts the balance point
+float BALANCE_OFFSET = -1.5f;   // degrees; +/- shifts the balance point
 
 // -- Setpoint / integrator limits (anti-windup) --
 const float MAX_LEAN      = 5.0f;    // outer loop may lean at most this many deg
